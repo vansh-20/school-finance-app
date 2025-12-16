@@ -1,24 +1,9 @@
-import React, { useEffect, useState } from "react";
-import {
-  onAuthStateChanged,
-  signInWithPopup,
-  GoogleAuthProvider,
-  signOut,
-} from "firebase/auth";
-import {
-  collection,
-  addDoc,
-  deleteDoc,
-  doc,
-  onSnapshot,
-  query,
-  updateDoc, // Make sure updateDoc is imported
-} from "firebase/firestore";
-import { auth, db } from "./firebase";
+import React, { useEffect, useState, useCallback } from "react";
+import { supabase } from "./supabase";
 import "./index.css";
 
 // =========================================================================
-// HELPER FUNCTIONS (Moved from other files)
+// HELPER FUNCTIONS
 // =========================================================================
 
 // Utility to get today's date in YYYY-MM-DD format
@@ -41,15 +26,20 @@ const formatDateForInput = (date) => {
 
 /**
  * Reusable function to calculate P&L summaries
+ * Note: Adapted for Supabase snake_case fields (head_type, head_id)
  */
 const getPLSummaryData = (transactionList, headList) => {
   const summary = {};
+
+  // Initialize summary with all known heads
   headList.forEach(h => {
-    summary[h.name] = { income: 0, expense: 0, type: h.headType };
+    // Supabase returns 'head_type', make sure to fallback correctly if needed
+    summary[h.name] = { income: 0, expense: 0, type: h.head_type }; 
   });
 
+  // Process transactions
   transactionList.forEach(t => {
-    const head = headList.find(h => h.id === t.headId);
+    const head = headList.find(h => h.id === t.head_id);
     const headName = head ? head.name : 'Uncategorized'; 
     
     if (!summary[headName]) {
@@ -130,7 +120,7 @@ const downloadCSV = (data, filename) => {
 // MAIN APP COMPONENT
 // =========================================================================
 function App() {
-  const [user, setUser] = useState(null);
+  const [session, setSession] = useState(null);
   const [heads, setHeads] = useState([]);
   const [allTransactions, setAllTransactions] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -140,134 +130,208 @@ function App() {
   const [endDate, setEndDate] = useState(getTodayDate);
 
 
-  // ===== AUTH LISTENER =====
+  // ===== DATA FETCHING (Wrapped in useCallback for stability) =====
+  // Wrap fetchData in useCallback so it's stable
+  const fetchData = useCallback(async () => {
+    try {
+      // 1. Fetch Heads
+      const { data: headsData, error: headsError } = await supabase
+        .from('heads')
+        .select('*');
+      
+      if (headsError) throw headsError;
+      setHeads(headsData);
+
+      // 2. Fetch Transactions
+      const { data: transData, error: transError } = await supabase
+        .from('transactions')
+        .select('*');
+      
+      if (transError) throw transError;
+      setAllTransactions(transData);
+
+      // 3. Auto-set Date Range logic
+      if (transData.length > 0 && startDate === getTodayDate()) {
+        const sortedData = transData.sort((a, b) => new Date(a.date) - new Date(b.date));
+        const firstDate = new Date(sortedData[0].date); 
+        const initialStartDate = new Date(firstDate.getFullYear(), firstDate.getMonth(), 1).toISOString().split('T')[0];
+        
+        if (initialStartDate !== startDate) {
+            setStartDate(initialStartDate);
+        }
+      }
+    } catch (error) {
+      console.error("Error fetching data:", error);
+    }
+  }, [startDate]); // <--- Dependency array for useCallback
+
+  // ===== AUTH & SUBSCRIPTION =====
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
+    // 1. Get initial session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      if (session) {
+        fetchData();
+      }
       setLoading(false);
     });
-    return () => unsub();
-  }, []);
 
-  // ===== FIRESTORE LISTENERS =====
-  useEffect(() => {
-    if (!user) return;
-
-    // Heads Listener
-    const qHeads = query(collection(db, `users/${user.uid}/heads`));
-    const unsubHeads = onSnapshot(qHeads, (snapshot) => {
-      const data = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-      setHeads(data);
-    });
-
-    // Transactions Listener
-    const qTrans = query(collection(db, `users/${user.uid}/transactions`));
-    const unsubTrans = onSnapshot(qTrans, (snapshot) => {
-      const data = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-      setAllTransactions(data); 
-      
-      // Initialize date range
-      if (data.length > 0 && startDate === getTodayDate()) {
-        const validData = data.filter(t => t.date && !isNaN(new Date(t.date)));
-        if (validData.length > 0) {
-            const sortedData = validData.sort((a, b) => new Date(a.date) - new Date(b.date));
-            const firstDate = new Date(sortedData[0].date); 
-            const lastDate = new Date(); 
-            const initialStartDate = new Date(firstDate.getFullYear(), firstDate.getMonth(), 1).toISOString().split('T')[0];
-            setStartDate(initialStartDate);
-            setEndDate(lastDate.toISOString().split('T')[0]);
-        }
+    // 2. Listen for auth changes
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+      if (session) {
+        fetchData();
+      } else {
+        setHeads([]);
+        setAllTransactions([]);
       }
     });
 
-    return () => {
-      unsubHeads();
-      unsubTrans();
-    };
-  }, [user, startDate]); // Added startDate to satisfy exhaustive-deps
+    return () => subscription.unsubscribe();
+  }, [fetchData]); // Dependent on fetchData now
 
-  // ===== FIRESTORE OPERATIONS =====
+
+  // ===== SUPABASE OPERATIONS =====
+  
   const addHead = async (name, headType) => {
-    if (!user || !name) return;
-    await addDoc(collection(db, `users/${user.uid}/heads`), { name, headType });
+    if (!session || !name) return;
+    
+    const { data, error } = await supabase
+        .from('heads')
+        .insert([
+            { 
+                user_id: session.user.id,
+                name, 
+                head_type: headType 
+            }
+        ])
+        .select();
+
+    if (error) {
+        console.error("Error adding head:", error);
+        return;
+    }
+    
+    if (data) {
+        setHeads([...heads, data[0]]);
+    }
   };
 
   const deleteHead = async (id) => {
-    if (!user) return;
-    await deleteDoc(doc(db, `users/${user.uid}/heads/${id}`));
+    if (!session) return;
+    
+    const { error } = await supabase
+        .from('heads')
+        .delete()
+        .eq('id', id);
+
+    if (error) {
+        console.error("Error deleting head:", error);
+        return;
+    }
+    setHeads(heads.filter(h => h.id !== id));
   };
 
   const addTransaction = async (amount, type, headId, date, description = "", receiptUrl = "") => {
-    if (!user || !amount || !headId || !date) return;
-    await addDoc(collection(db, `users/${user.uid}/transactions`), {
-      amount: parseFloat(amount),
-      type,
-      headId,
-      date, 
-      description,
-      receiptUrl,
-      createdAt: new Date().toISOString(), 
-    });
+    if (!session || !amount || !headId || !date) return;
+    
+    const { data, error } = await supabase
+        .from('transactions')
+        .insert([
+            {
+                user_id: session.user.id,
+                amount: parseFloat(amount),
+                type,
+                head_id: headId, // mapped to head_id
+                date, 
+                description,
+                receipt_url: receiptUrl
+            }
+        ])
+        .select();
+
+    if (error) {
+        console.error("Error adding transaction:", error);
+        return;
+    }
+
+    if (data) {
+        setAllTransactions([...allTransactions, data[0]]);
+    }
   };
 
-  // NEW: Delete and Update Transaction functions
   const deleteTransaction = async (id) => {
-    if (!user || !id) return;
+    if (!session || !id) return;
     if (!window.confirm("Are you sure you want to delete this transaction?")) {
       return; 
     }
-    try {
-      await deleteDoc(doc(db, `users/${user.uid}/transactions/${id}`));
-    } catch (error) {
+    
+    const { error } = await supabase
+        .from('transactions')
+        .delete()
+        .eq('id', id);
+        
+    if (error) {
       console.error("Error deleting transaction: ", error);
       alert("Failed to delete transaction.");
+      return;
     }
+    
+    setAllTransactions(allTransactions.filter(t => t.id !== id));
   };
-  // ... (inside function App())
 
   const updateTransactionAmount = async (id, newAmountString) => {
-    if (!user || !id) return;
+    if (!session || !id) return;
     
     const newAmount = parseFloat(newAmountString);
-    
-    // Validate the new amount
     if (isNaN(newAmount) || newAmount <= 0) {
       alert("Please enter a valid, positive amount.");
-      return; // Stop if the amount is not a valid number
+      return; 
     }
 
-    const transDocRef = doc(db, `users/${user.uid}/transactions/${id}`);
-    try {
-      await updateDoc(transDocRef, {
-        amount: newAmount // Save the parsed number
-      });
-    } catch (error) {
+    const { error } = await supabase
+        .from('transactions')
+        .update({ amount: newAmount })
+        .eq('id', id);
+
+    if (error) {
       console.error("Error updating amount: ", error);
       alert("Failed to update amount.");
+      return;
     }
+    
+    // Optimistic update locally
+    setAllTransactions(allTransactions.map(t => t.id === id ? { ...t, amount: newAmount } : t));
   };
 
   const updateTransactionDescription = async (id, newDescription) => {
-    if (!user || !id) return;
-    const transDocRef = doc(db, `users/${user.uid}/transactions/${id}`);
-    try {
-      await updateDoc(transDocRef, {
-        description: newDescription
-      });
-    } catch (error) {
+    if (!session || !id) return;
+    
+    const { error } = await supabase
+        .from('transactions')
+        .update({ description: newDescription })
+        .eq('id', id);
+
+    if (error) {
       console.error("Error updating description: ", error);
       alert("Failed to update description.");
+      return;
     }
+
+    setAllTransactions(allTransactions.map(t => t.id === id ? { ...t, description: newDescription } : t));
   };
 
   // ===== AUTH ACTIONS =====
   const handleLogin = async () => {
-    const provider = new GoogleAuthProvider();
-    await signInWithPopup(auth, provider);
+    await supabase.auth.signInWithOAuth({
+      provider: 'google',
+    });
   };
 
   const handleLogout = async () => {
-    await signOut(auth);
+    await supabase.auth.signOut();
   };
 
   // ===== DATA FILTERING AND COMPUTATION =====
@@ -293,40 +357,35 @@ function App() {
   const balance = totalIncome - totalExpense;
 
 
-  // =========================================================================
-  // LOGIC MOVED FROM ReportFilter.jsx and AllTimeSummary.jsx
-  // =========================================================================
-
-  // 1. Calculate P&L Summary for FILTERED data
+  // 3. Calculate P&L Summaries
+  // FILTERED data
   const filteredPlSummary = getPLSummaryData(filteredTransactions, heads);
   const filteredTotalNet = filteredPlSummary.reduce((acc, item) => acc + item.Net, 0);
   const filteredTotalIncome = filteredPlSummary.reduce((acc, item) => acc + item.Income, 0);
   const filteredTotalExpense = filteredPlSummary.reduce((acc, item) => acc + item.Expense, 0);
 
-  // 2. Calculate P&L Summary for ALL-TIME data
+  // ALL-TIME data
   const allTimePlSummary = getPLSummaryData(allTransactions, heads);
   const allTimeTotalIncome = allTimePlSummary.reduce((acc, item) => acc + item.Income, 0);
   const allTimeTotalExpense = allTimePlSummary.reduce((acc, item) => acc + item.Expense, 0);
   const allTimeTotalNet = allTimeTotalIncome - allTimeTotalExpense;
 
-  // 3. Edit Handler (for transaction description)
+  // 4. Edit Handler (for transaction description)
   const handleEditDescription = (id, currentDescription) => {
     const newDescription = window.prompt("Enter new description:", currentDescription);
     if (newDescription !== null && newDescription !== currentDescription) {
       updateTransactionDescription(id, newDescription);
     }
   };
-  // (This goes near your other handlers like handleEditDescription)
+
   const handleEditAmount = (id, currentAmount) => {
     const newAmountString = window.prompt("Enter new amount:", currentAmount);
-    
-    // Check if user clicked OK and the value is different
     if (newAmountString !== null && newAmountString !== String(currentAmount)) {
       updateTransactionAmount(id, newAmountString);
     }
   };
 
-  // 4. Export Handler
+  // 5. Export Handler
   const handleExport = (reportType) => {
     let dataToExport = [];
     let filename = 'report.csv';
@@ -334,48 +393,40 @@ function App() {
     const formattedEndDate = formatDateForInput(endDate);
 
     switch (reportType) {
-      case "Filtered Transactions List": { // <-- Added brace
+      case "Filtered Transactions List": { 
         dataToExport = filteredTransactions
           .sort((a, b) => new Date(a.date) - new Date(b.date))
           .map(t => {
-            const head = heads.find((h) => h.id === t.headId);
+            const head = heads.find((h) => h.id === t.head_id);
             return {
               Date: t.date,
               Type: t.type,
               Head: head ? head.name : "Unknown",
               Description: t.description || "",
               Amount: t.amount,
-              ReceiptURL: t.receiptUrl || ""
+              ReceiptURL: t.receipt_url || ""
             };
           });
         filename = `Transactions_${formattedStartDate}_to_${formattedEndDate}.csv`;
         break;
-      } // <-- Added brace
+      } 
 
-      case "Filtered P&L Head Summary": { // <-- Added brace
+      case "Filtered P&L Head Summary": { 
         // Get totals for the filtered data
-        const totalIncomeF = filteredPlSummary.reduce((acc, item) => acc + item.Income, 0);
-        const totalExpenseF = filteredPlSummary.reduce((acc, item) => acc + item.Expense, 0);
-        const totalNetF = totalIncomeF - totalExpenseF;
-        const totalsRowF = { Head: "TOTALS", Type: "", Income: totalIncomeF, Expense: totalExpenseF, Net: totalNetF };
+        const totalsRowF = { Head: "TOTALS", Type: "", Income: filteredTotalIncome, Expense: filteredTotalExpense, Net: filteredTotalNet };
         
         dataToExport = [...filteredPlSummary, totalsRowF]; 
         filename = `PL_Summary_${formattedStartDate}_to_${formattedEndDate}.csv`;
         break;
-      } // <-- Added brace
+      } 
 
-      case "All-Time P&L Head Summary": { // <-- Added brace
-        const allTimeSummary = getPLSummaryData(allTransactions, heads);
-        // Get totals for all-time data
-        const totalIncomeA = allTimeSummary.reduce((acc, item) => acc + item.Income, 0);
-        const totalExpenseA = allTimeSummary.reduce((acc, item) => acc + item.Expense, 0);
-        const totalNetA = totalIncomeA - totalExpenseA;
-        const totalsRowA = { Head: "TOTALS", Type: "", Income: totalIncomeA, Expense: totalExpenseA, Net: totalNetA };
+      case "All-Time P&L Head Summary": { 
+        const totalsRowA = { Head: "TOTALS", Type: "", Income: allTimeTotalIncome, Expense: allTimeTotalExpense, Net: allTimeTotalNet };
 
-        dataToExport = [...allTimeSummary, totalsRowA];
+        dataToExport = [...allTimePlSummary, totalsRowA];
         filename = 'PL_Summary_All_Time.csv';
         break;
-      } // <-- Added brace
+      } 
       
       default:
         alert("Unknown report type.");
@@ -388,7 +439,7 @@ function App() {
   if (loading)
     return <div className="flex items-center justify-center h-screen">Loading...</div>;
 
-  if (!user) {
+  if (!session) {
     return (
       <div className="flex flex-col items-center justify-center h-screen">
         <h1 className="text-3xl font-bold mb-4">Expense Tracker</h1>
@@ -407,7 +458,9 @@ function App() {
     <div className="min-h-screen bg-gray-100 p-6 font-sans">
       {/* Header */}
       <div className="flex justify-between items-center mb-6 border-b pb-4">
-        <h1 className="text-2xl font-semibold text-gray-800">Welcome, {user.displayName}</h1>
+        <h1 className="text-2xl font-semibold text-gray-800">
+            Welcome, {session.user.user_metadata.full_name || session.user.email}
+        </h1>
         <button
           onClick={handleLogout}
           className="bg-red-500 text-white px-4 py-2 rounded-lg hover:bg-red-600 transition"
@@ -448,7 +501,7 @@ function App() {
       </div>
 
       {/* ===================================================================
-          REPORTING SECTION (MOVED FROM ReportFilter.jsx)
+          REPORTING SECTION
           =================================================================== */}
       <div className="bg-white shadow rounded-lg p-6 mb-6">
         <h2 className="text-xl font-bold mb-4 text-gray-700">Reporting & Exports</h2>
@@ -563,7 +616,7 @@ function App() {
             </thead>
             <tbody>
               {filteredTransactions.sort((a, b) => new Date(b.date) - new Date(a.date)).map((t) => {
-                const head = heads.find((h) => h.id === t.headId);
+                const head = heads.find((h) => h.id === t.head_id);
                 return (
                   <tr key={t.id} className="hover:bg-gray-50 text-sm">
                     <td className="py-2 px-4 border-b">{new Date(t.date).toLocaleDateString()}</td>
@@ -574,12 +627,12 @@ function App() {
                     </td>
                     <td className="py-2 px-4 border-b">{t.description || 'N/A'}</td>
                     <td className="py-2 px-4 border-b">
-                      {t.receiptUrl ? <a href={t.receiptUrl} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">View</a> : 'N/A'}
+                      {t.receipt_url ? <a href={t.receipt_url} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">View</a> : 'N/A'}
                     </td>
                     <td className={`py-2 px-4 border-b text-right font-semibold ${t.type === 'income' ? 'text-green-600' : 'text-red-600'}`}>
                       {t.type === 'income' ? '' : '-'}₹{t.amount.toFixed(2)}
                     </td>
-                   {/* ... inside the <tbody> .map((t) => { ... */}
+                  
                   <td className="py-2 px-4 border-b text-right space-x-2">
                     <button
                       onClick={() => handleEditDescription(t.id, t.description)}
@@ -587,7 +640,6 @@ function App() {
                     >
                       Edit Desc
                     </button>
-                    {/* NEW BUTTON */}
                     <button
                       onClick={() => handleEditAmount(t.id, t.amount)}
                       className="text-xs bg-yellow-100 text-yellow-700 px-2 py-1 rounded-full hover:bg-yellow-200"
@@ -601,7 +653,6 @@ function App() {
                       Delete
                     </button>
                   </td>
-                  {/* ... */}
                   </tr>
                 );
               })}
@@ -611,7 +662,7 @@ function App() {
       </div>
       
       {/* ===================================================================
-          ALL-TIME SUMMARY SECTION (MOVED FROM AllTimeSummary.jsx)
+          ALL-TIME SUMMARY SECTION
           =================================================================== */}
       <div className="bg-white shadow rounded-lg p-6 mb-6">
         <h2 className="text-xl font-bold mb-4 text-gray-700">All-Time Financial Performance by P&L Head</h2>
@@ -722,12 +773,12 @@ function HeadManager({ heads, addHead, deleteHead }) {
         <ul className="divide-y divide-gray-200">
             {filteredHeads.map((h) => (
             <li key={h.id} className="flex justify-between items-center py-2 px-1 hover:bg-gray-50 transition">
-                <span className={`font-medium ${(h.headType || 'expense') === 'income' ? 'text-green-700' : 'text-red-700'}`}>
+                <span className={`font-medium ${h.head_type === 'income' ? 'text-green-700' : 'text-red-700'}`}>
                     {h.name} 
                     <span className="text-xs ml-2 px-2 py-0.5 rounded-full"
-                          style={{ backgroundColor: (h.headType || 'expense') === 'income' ? '#d1e7dd' : '#f8d7da', 
-                                  color: (h.headType || 'expense') === 'income' ? '#0f5132' : '#842029' }}>
-                        {(h.headType || 'UNCATEGORIZED').toUpperCase()}
+                          style={{ backgroundColor: h.head_type === 'income' ? '#d1e7dd' : '#f8d7da', 
+                                  color: h.head_type === 'income' ? '#0f5132' : '#842029' }}>
+                        {(h.head_type || 'UNCATEGORIZED').toUpperCase()}
                     </span>
                 </span>
                 <button
@@ -756,7 +807,7 @@ function TransactionManager({ heads, addTransaction }) {
   const [receiptUrl, setReceiptUrl] = useState("");
 
   const filteredHeads = heads
-    .filter(h => h.headType === type)
+    .filter(h => h.head_type === type)
     .sort((a, b) => a.name.localeCompare(b.name));
 
 
